@@ -1,7 +1,15 @@
 import scrapy
 import json
+import asyncio
 from urllib.parse import quote
-from playwright.sync_api import sync_playwright
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver import Chrome
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.options import Options
 
 
 class NikeSpider(scrapy.Spider):
@@ -17,7 +25,7 @@ class NikeSpider(scrapy.Spider):
         'localizedRangeStr': quote('{lowestPrice} — {highestPrice}')
     }
 
-    def start_requests(self):
+    async def start(self):
         # 构造完整的API请求URL
         api_url = f"{self.start_urls}?{'&'.join([f'{k}={v}' for k,v in self.query_params.items()])}"
         
@@ -49,18 +57,16 @@ class NikeSpider(scrapy.Spider):
                     'detail': '',
                     'img_urls': product.get("images", {}).get("squarishURL", ""),
                 }
-                # yield scrapy.Request(
-                #     url = product.get('url').replace("{countryLang}", "https://www.nike.com.cn"),
-                #     headers={'Referer': 'https://www.nike.com.cn/'},
-                #     meta={"playwright":True},
-                #     callback=self.parse_detail,
-                # )
-
+                tartget = product.get('url').split('-')[-2].split('/')[0]
                 yield scrapy.Request(
-                    url = "https://api.nike.com.cn/discover/product_details_availability/v1/marketplace/CN/language/zh-Hans/consumerChannelId/d9a5bc42-4b9c-4976-858a-f159cf99c647/groupKey/" + product.get('url').split('-')[-2].split('/')[0],
-                    headers={'nike-api-caller-id':'com.nike.commerce.nikedotcom.web'},
-                    meta={'products':product_data},
-                    callback=self.parse_size,
+                    url = product.get('url').replace("{countryLang}", "https://www.nike.com.cn"),
+                    headers={'Referer': 'https://www.nike.com.cn/'},
+                    meta={
+                        'products':product_data,
+                        'target':tartget,
+                        'handle_httpstatus_all': True,
+                    },
+                    callback=self.parse_detail,
                 )
 
             # 分页处理（示例：修改anchor参数获取下一页）
@@ -71,7 +77,7 @@ class NikeSpider(scrapy.Spider):
                 'anchor%3D'+next_anchor
             )
           
-            # 请求下一页
+            #请求下一页
             next_page_url = f"{self.start_urls}?{'&'.join([f'{k}={v}' for k,v in self.query_params.items()])}"
             yield scrapy.Request(
                 url=next_page_url,
@@ -81,11 +87,48 @@ class NikeSpider(scrapy.Spider):
         except Exception as e:
             self.logger.error(f"API解析失败: {e}")
 
-    def parse_detail(self,response):
-        yield {
-        "dynamic_data": response.css("div.rendered-content::text").get()
-    }
-    
+    def parse_detail(self, response):
+        # 初始化 Selenium
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")  # 启用无头模式
+        chrome_options.add_argument("--disable-gpu")  # 禁用GPU加速
+        driver = Chrome(service=Service(ChromeDriverManager().install()),options=chrome_options)
+        driver.get(response.url)
+        product_data = response.meta['products'].copy()
+        try:
+            # 1. 提取图片的 src（原逻辑）
+            images = driver.find_elements(By.XPATH, '//img[@data-testid="mobile-image-carousel-image"]')
+            if images:
+                src = images[0].get_attribute('src')
+                product_data['img_urls'] = src
+
+            # 2. 定位并点击按钮（"查看产品细节"）
+            button = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, '//button[contains(text(), "查看产品细节")]'))
+            )
+            button.click()
+
+            # 3. 等待模态框加载完成
+            modal = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, '//div[@data-testid="modal-backdrop"]//div[@role="modal"]'))
+            )
+
+            # 4. 提取模态框中的所有文本
+            all_text = modal.text
+            product_data['detail'] = all_text
+
+
+        except Exception as e:
+            print("发生错误:", e)
+        finally:
+            driver.quit()
+            target = response.meta['target']
+            yield scrapy.Request(
+                        url = "https://api.nike.com.cn/discover/product_details_availability/v1/marketplace/CN/language/zh-Hans/consumerChannelId/d9a5bc42-4b9c-4976-858a-f159cf99c647/groupKey/" + target,
+                        headers={'nike-api-caller-id':'com.nike.commerce.nikedotcom.web'},
+                        meta={'products':product_data},
+                        callback=self.parse_size,
+                    )
 
     def parse_size(self, response):
         try:
